@@ -8,7 +8,7 @@ import pytest
 
 from server.agents.execution_agent.runtime import ExecutionResult
 from server.agents.interaction_agent import runtime as interaction_runtime
-from server.openrouter_client import OpenRouterError
+from server.llm_client import LLMConnectionError, LLMError, LLMTimeoutError
 from server.tests.conftest import completion, tool_call
 
 
@@ -173,19 +173,78 @@ async def test_wait_loop_stops_once_work_is_in_flight(
     assert not any("couldn't complete" in reply for reply in replies)
 
 
-async def test_rate_limit_failure_mentions_the_daily_limit(
+async def test_unreachable_model_server_is_reported_clearly(
     scripted_llm, stub_dispatched_agents, conversation_log
 ) -> None:
+    """A stopped llama-server must produce actionable guidance, not a crash."""
     responses = [
-        OpenRouterError("OpenRouter request failed (429): free-models-per-day limit reached")
+        LLMConnectionError("Could not connect to http://127.0.0.1:8080/v1. Is llama-server running?")
     ]
 
     result, _ = await _run(scripted_llm, responses, stub_dispatched_agents)
 
     assert result.success is False
     replies = [payload for tag, _, payload in conversation_log.iter_entries() if tag == "poke_reply"]
-    assert "daily limit" in replies[-1]
+    assert "llama-server" in replies[-1]
     assert "couldn't complete" not in replies[-1]
+
+
+async def test_context_overflow_is_not_blamed_on_connectivity(
+    scripted_llm, stub_dispatched_agents, conversation_log
+) -> None:
+    """A 400 overflow must not be reported as an unreachable server."""
+    responses = [
+        LLMError(
+            "Model request failed (400): {'message': 'request (39787 tokens) exceeds the "
+            "available context size (32768 tokens), try increasing it'}"
+        )
+    ]
+
+    result, _ = await _run(scripted_llm, responses, stub_dispatched_agents)
+
+    assert result.success is False
+    replies = [payload for tag, _, payload in conversation_log.iter_entries() if tag == "poke_reply"]
+    assert "context" in replies[-1]
+    assert "llama-server is running" not in replies[-1]
+
+
+async def test_timeout_is_reported_as_a_timeout(
+    scripted_llm, stub_dispatched_agents, conversation_log
+) -> None:
+    responses = [LLMTimeoutError("Model request timed out after 300s")]
+
+    result, _ = await _run(scripted_llm, responses, stub_dispatched_agents)
+
+    assert result.success is False
+    replies = [payload for tag, _, payload in conversation_log.iter_entries() if tag == "poke_reply"]
+    assert "too long" in replies[-1]
+    assert "LLM_TIMEOUT" in replies[-1]
+
+
+async def test_reasoning_only_reply_is_not_silent(
+    scripted_llm, stub_dispatched_agents, conversation_log
+) -> None:
+    """Qwen3 can answer in reasoning_content with an empty content field."""
+    reasoning = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "I have nothing pending, so no reply is needed.",
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+
+    result, fake = await _run(scripted_llm, [reasoning], stub_dispatched_agents)
+
+    fake.assert_drained()
+    assert result.success is True
+    assert "nothing pending" in result.response
+    replies = [payload for tag, _, payload in conversation_log.iter_entries() if tag == "poke_reply"]
+    assert replies and "nothing pending" in replies[-1]
 
 
 async def test_missing_configuration_reports_clearly(
@@ -194,7 +253,48 @@ async def test_missing_configuration_reports_clearly(
     from server.config import Settings
 
     # Settings defaults are captured at import, so patch the resolved settings object
-    monkeypatch.setattr(interaction_runtime, "get_settings", lambda: Settings(openrouter_api_key=None))
+    monkeypatch.setattr(interaction_runtime, "get_settings", lambda: Settings(llm_base_url=""))
 
-    with pytest.raises(ValueError, match="OpenRouter API key not configured"):
+    with pytest.raises(ValueError, match="LLM_BASE_URL"):
         interaction_runtime.InteractionAgentRuntime()
+
+
+def test_approve_draft_marks_a_created_draft() -> None:
+    from server.services.gmail import draft_guard
+    from server.agents.interaction_agent import tools as interaction_tools
+
+    draft_guard.reset()
+    draft_guard.register_created_draft({"draft_id": "d-1"})
+
+    result = interaction_tools.approve_draft_for_sending("d-1")
+
+    assert result.success is True
+    assert draft_guard.is_approved("d-1")
+    draft_guard.reset()
+
+
+def test_approve_draft_rejects_an_unknown_draft() -> None:
+    """Approval cannot be manufactured for a draft that was never created."""
+    from server.services.gmail import draft_guard
+    from server.agents.interaction_agent import tools as interaction_tools
+
+    draft_guard.reset()
+
+    result = interaction_tools.approve_draft_for_sending("ghost")
+
+    assert result.success is False
+    assert "not created in this session" in result.payload["error"]
+    assert draft_guard.is_approved("ghost") is False
+
+
+def test_approve_draft_tool_routes_through_the_router() -> None:
+    from server.services.gmail import draft_guard
+    from server.agents.interaction_agent import tools as interaction_tools
+
+    draft_guard.reset()
+    draft_guard.register_created_draft({"draft_id": "d-9"})
+
+    result = interaction_tools.handle_tool_call("approve_draft", {"draft_id": "d-9"})
+
+    assert result.success is True
+    draft_guard.reset()

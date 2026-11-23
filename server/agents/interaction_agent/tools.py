@@ -20,7 +20,7 @@ class ToolResult:
     user_message: Optional[str] = None
     recorded_reply: bool = False
 
-# Tool schemas for OpenRouter
+# Tool schemas for the interaction agent
 TOOL_SCHEMAS = [
     {
         "type": "function",
@@ -32,9 +32,13 @@ TOOL_SCHEMAS = [
                 "properties": {
                     "agent_name": {
                         "type": "string",
-                        "description": "Human-readable agent name describing its purpose (e.g., 'Vercel Job Offer', 'Email to Sharanjeet'). This name will be used to identify and potentially reuse the agent."
+                        "description": "Human-readable agent name describing its purpose (e.g., 'Vercel Job Offer', 'Nanoleaf Triangle Deals'). This name identifies and may reuse the agent, so name it after the specific task or subject, not the channel."
                     },
                     "instructions": {"type": "string", "description": "Instructions for the agent to execute."},
+                    "general_purpose": {
+                        "type": "boolean",
+                        "description": "Set true only for a channel-wide agent that handles general ongoing monitoring, such as inbox triage. Specific tasks must use their own topic-named agent instead of a general-purpose one.",
+                    },
                 },
                 "required": ["agent_name", "instructions"],
                 "additionalProperties": False,
@@ -79,8 +83,30 @@ TOOL_SCHEMAS = [
                         "type": "string",
                         "description": "Email body content (plain text).",
                     },
+                    "draft_id": {
+                        "type": "string",
+                        "description": "Identifier of the created Gmail draft, when one exists.",
+                    },
                 },
                 "required": ["to", "subject", "body"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "approve_draft",
+            "description": "Mark a draft as approved to send. Call this ONLY after the user explicitly confirms they want it sent.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "draft_id": {
+                        "type": "string",
+                        "description": "Identifier of the draft the user approved for sending.",
+                    },
+                },
+                "required": ["draft_id"],
                 "additionalProperties": False,
             },
         },
@@ -109,12 +135,20 @@ _EXECUTION_BATCH_MANAGER = ExecutionBatchManager()
 
 
 # Create or reuse execution agent and dispatch instructions asynchronously
-def send_message_to_agent(agent_name: str, instructions: str) -> ToolResult:
+def send_message_to_agent(
+    agent_name: str,
+    instructions: str,
+    general_purpose: bool = False,
+) -> ToolResult:
     """Send instructions to an execution agent."""
     roster = get_agent_roster()
     roster.load()
     # Using an agent refreshes its activity so it stays visible to the interaction agent
-    is_new = roster.touch(agent_name, instructions)
+    is_new = roster.touch(
+        agent_name,
+        instructions,
+        general_purpose=general_purpose or None,
+    )
 
     get_execution_agent_logs().record_request(agent_name, instructions)
 
@@ -166,6 +200,7 @@ def send_draft(
     to: str,
     subject: str,
     body: str,
+    draft_id: Optional[str] = None,
 ) -> ToolResult:
     """Record a draft update in the conversation log for the interaction agent."""
     log = get_conversation_log()
@@ -181,9 +216,38 @@ def send_draft(
             "status": "draft_recorded",
             "to": to,
             "subject": subject,
+            "draft_id": draft_id,
         },
         recorded_reply=True,
     )
+
+
+# Mark a draft as approved to send, after the user explicitly confirms
+def approve_draft_for_sending(draft_id: str) -> ToolResult:
+    """Record explicit user approval for a draft so it may be sent.
+
+    Only call this when the user has actually asked to send. Creating a draft
+    does not approve it; sending without approval is refused by the Gmail tools.
+    """
+    from ...services.gmail import draft_guard
+
+    key = (draft_id or "").strip()
+    if not key:
+        return ToolResult(success=False, payload={"error": "draft_id is required"})
+
+    if not draft_guard.approve_draft(key):
+        return ToolResult(
+            success=False,
+            payload={
+                "error": (
+                    f"Draft {key} was not created in this session, so it cannot be approved. "
+                    "Create the draft first and show it to the user."
+                )
+            },
+        )
+
+    logger.info("Draft approved for sending: %s", key)
+    return ToolResult(success=True, payload={"status": "approved", "draft_id": key})
 
 
 # Record silent wait state to avoid duplicate responses
@@ -228,6 +292,8 @@ def handle_tool_call(name: str, arguments: Any) -> ToolResult:
             return send_message_to_user(**args)
         if name == "send_draft":
             return send_draft(**args)
+        if name == "approve_draft":
+            return approve_draft_for_sending(**args)
         if name == "wait":
             return wait(**args)
 

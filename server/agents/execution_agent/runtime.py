@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from .agent import ExecutionAgent
 from .tools import get_tool_schemas, get_tool_registry
 from ...config import get_settings
-from ...openrouter_client import request_chat_completion
+from ...llm_client import LLMError, assistant_text, extract_assistant_message, request_chat_completion
 from ...logging_config import logger
 
 
@@ -31,13 +31,17 @@ class ExecutionAgentRuntime:
     def __init__(self, agent_name: str):
         settings = get_settings()
         self.agent = ExecutionAgent(agent_name)
-        self.api_key = settings.openrouter_api_key
+        self.api_key = settings.llm_api_key
+        self.base_url = settings.llm_base_url
         self.model = settings.execution_agent_model
         self.tool_registry = get_tool_registry(agent_name=agent_name)
         self.tool_schemas = get_tool_schemas()
 
-        if not self.api_key:
-            raise ValueError("OpenRouter API key not configured. Set OPENROUTER_API_KEY environment variable.")
+        if not self.base_url:
+            raise ValueError(
+                "No model endpoint configured. Set the LLM_BASE_URL environment variable "
+                "(for example http://127.0.0.1:8080/v1)."
+            )
 
     # Main execution loop for running agent with LLM calls and tool execution
     async def execute(self, instructions: str) -> ExecutionResult:
@@ -56,7 +60,7 @@ class ExecutionAgentRuntime:
                     f"[{self.agent.name}] Requesting plan (iteration {iteration + 1})"
                 )
                 response = await self._make_llm_call(system_prompt, messages, with_tools=True)
-                assistant_message = response.get("choices", [{}])[0].get("message", {})
+                assistant_message = self._extract_assistant_message(response)
 
                 if not assistant_message:
                     raise RuntimeError("LLM response did not include an assistant message")
@@ -66,7 +70,7 @@ class ExecutionAgentRuntime:
 
                 assistant_entry: Dict[str, Any] = {
                     "role": "assistant",
-                    "content": assistant_message.get("content", "") or "",
+                    "content": assistant_text(assistant_message),
                 }
                 if raw_tool_calls:
                     assistant_entry["tool_calls"] = raw_tool_calls
@@ -80,6 +84,27 @@ class ExecutionAgentRuntime:
                     tool_name = tool_call.get("name", "")
                     tool_args = tool_call.get("arguments", {})
                     call_id = tool_call.get("id")
+                    argument_error = tool_call.get("argument_error")
+
+                    # Never run a tool whose arguments failed to parse.
+                    if argument_error:
+                        logger.warning(
+                            f"[{self.agent.name}] Malformed arguments for {tool_name}: {argument_error}"
+                        )
+                        failure = {
+                            "error": f"Tool arguments were not valid JSON: {argument_error}. "
+                            "Re-issue the call with a well-formed JSON object."
+                        }
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call_id or tool_name or "unknown_tool",
+                                "content": self._format_tool_result(
+                                    tool_name or "<unknown>", False, failure, {}
+                                ),
+                            }
+                        )
+                        continue
 
                     if not tool_name:
                         logger.warning("Tool call missing name: %s", tool_call)
@@ -148,7 +173,7 @@ class ExecutionAgentRuntime:
                 error=error_msg
             )
 
-    # Execute OpenRouter API call with system prompt, messages, and optional tool schemas
+    # Execute the chat completion call with system prompt, messages, and optional tool schemas
     async def _make_llm_call(self, system_prompt: str, messages: List[Dict], with_tools: bool) -> Dict:
         """Make an LLM call."""
         tools_to_send = self.tool_schemas if with_tools else None
@@ -158,30 +183,57 @@ class ExecutionAgentRuntime:
             messages=messages,
             system=system_prompt,
             api_key=self.api_key,
-            tools=tools_to_send
+            tools=tools_to_send,
+            base_url=self.base_url,
+            context_label=f"agent:{self.agent.name}",
         )
+
+    # Extract the assistant message, tolerating reasoning-only replies
+    def _extract_assistant_message(self, response: Dict[str, Any]) -> Dict[str, Any]:
+        """Return the assistant message, falling back to reasoning text."""
+
+        try:
+            return extract_assistant_message(response)
+        except LLMError:
+            return {}
 
     # Parse and validate tool calls from LLM response into structured format
     def _extract_tool_calls(self, raw_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Extract tool calls from an assistant message."""
+        """Extract tool calls from an assistant message.
+
+        Malformed arguments are surfaced as an error rather than silently
+        replaced with ``{}``: executing a tool with empty arguments can look
+        like success while doing the wrong thing.
+        """
         tool_calls: List[Dict[str, Any]] = []
 
         for tool in raw_tools:
             function = tool.get("function", {})
             name = function.get("name", "")
             args = function.get("arguments", "")
+            argument_error: Optional[str] = None
 
             if isinstance(args, str):
-                try:
-                    args = json.loads(args) if args else {}
-                except json.JSONDecodeError:
+                if args.strip():
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError as exc:
+                        args = {}
+                        argument_error = f"invalid json: {exc}"
+                else:
                     args = {}
+            elif args is None:
+                args = {}
+            elif not isinstance(args, dict):
+                argument_error = f"unsupported argument type: {type(args).__name__}"
+                args = {}
 
             if name:
                 tool_calls.append({
                     "id": tool.get("id"),
                     "name": name,
                     "arguments": args,
+                    "argument_error": argument_error,
                 })
 
         return tool_calls
